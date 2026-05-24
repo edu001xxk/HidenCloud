@@ -3,7 +3,7 @@ name: HidenCloud 续期
 on:
   workflow_dispatch:
   schedule:
-    - cron: '13 3 4 5 *'   # 自动更新下次运行时间
+    - cron: '2 3 25 5 *' # 自动更新下次运行时间
 
 permissions:
   contents: write
@@ -15,10 +15,10 @@ jobs:
 
     steps:
       - name: 拉取仓库代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 设置 Python 环境
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -27,11 +27,13 @@ jobs:
           pip install --quiet seleniumbase requests beautifulsoup4
 
       - name: 安装并启动代理
+        id: proxy_setup
         env:
           PROXY_NODE: ${{ secrets.PROXY_NODE }}
         run: |
           if [ -z "$PROXY_NODE" ]; then
             echo "[INFO] 未配置代理，直连模式"
+            echo "PROXY_SERVER=" >> $GITHUB_ENV
             exit 0
           fi
 
@@ -43,13 +45,19 @@ jobs:
           from urllib.parse import parse_qs, unquote, urlparse
 
           def mask(s):
-              return f"{s[:2]}***{s[-2:]}" if len(s) > 4 else "****"
+              if len(s) > 4:
+                  return f"*{s[1]}***{s[-2]}*"
+              return "****"
+
+          def mask_port(p):
+              return "****"
 
           url = os.environ.get("PROXY_NODE", "").strip()
           if not url:
               print("[ERROR] PROXY_NODE 为空")
               sys.exit(1)
 
+          # 统一解析协议类型
           if url.startswith("vless://"):
               protocol = "vless"
               content = url[8:]
@@ -65,14 +73,6 @@ jobs:
           elif url.startswith("socks5://") or url.startswith("socks://"):
               protocol = "socks5"
               content = url.split("://")[1].split("#")[0]
-              if "@" in content:
-                  server = content.split("@")[1].split(":")[0]
-              else:
-                  server = content.split(":")[0]
-              print(f"[INFO] SOCKS5 -> {mask(server)}")
-              with open("use_external_socks.txt", "w") as f:
-                  f.write(url.split("#")[0])
-              sys.exit(0)
           else:
               print(f"[ERROR] 不支持的协议: {url.split('://')[0]}")
               sys.exit(1)
@@ -80,6 +80,7 @@ jobs:
           if "#" in content:
               content = content.rsplit("#", 1)[0]
 
+          # 所有协议统一生成 Xray 配置，通过本地 127.0.0.1:1080 转发
           config = {
               "log": {"loglevel": "warning"},
               "inbounds": [
@@ -89,7 +90,36 @@ jobs:
               "outbounds": []
           }
 
-          if protocol == "vless":
+          if protocol == "socks5":
+              # 解析 socks5://user:pass@host:port
+              users = None
+              server_part = content
+              if "@" in content:
+                  auth_part, server_part = content.rsplit("@", 1)
+                  if ":" in auth_part:
+                      user, pwd = auth_part.split(":", 1)
+                      users = [{"user": user, "pass": pwd}]
+              if ":" in server_part:
+                  address, port = server_part.rsplit(":", 1)
+              else:
+                  address, port = server_part, "1080"
+
+              print(f"[INFO] SOCKS5 -> {mask(address)}:{mask_port(port)}")
+
+              outbound = {
+                  "protocol": "socks",
+                  "settings": {
+                      "servers": [{
+                          "address": address,
+                          "port": int(port),
+                      }]
+                  }
+              }
+              if users:
+                  outbound["settings"]["servers"][0]["users"] = users
+              config["outbounds"].append(outbound)
+
+          elif protocol == "vless":
               uuid, rest = content.split("@", 1)
               if "?" in rest:
                   host_port, params_str = rest.split("?", 1)
@@ -111,7 +141,7 @@ jobs:
               host = params.get("host", [sni])[0]
               path = unquote(params.get("path", ["/"])[0])
 
-              print(f"[INFO] VLESS -> {mask(address)}:{port} (security: {security}, network: {network})")
+              print(f"[INFO] VLESS -> {mask(address)}:{mask_port(port)} (security: {security}, network: {network})")
 
               outbound = {
                   "protocol": "vless",
@@ -179,7 +209,7 @@ jobs:
               path = vm.get("path", "/")
               fp = vm.get("fp", "chrome")
 
-              print(f"[INFO] VMess -> {mask(address)}:{port} (network: {network}, tls: {tls})")
+              print(f"[INFO] VMess -> {mask(address)}:{mask_port(port)} (network: {network}, tls: {tls})")
 
               outbound = {
                   "protocol": "vmess",
@@ -230,7 +260,7 @@ jobs:
               path = unquote(params.get("path", ["/"])[0])
               fp = params.get("fp", ["chrome"])[0]
 
-              print(f"[INFO] Trojan -> {mask(address)}:{port} (network: {network})")
+              print(f"[INFO] Trojan -> {mask(address)}:{mask_port(port)} (network: {network})")
 
               outbound = {
                   "protocol": "trojan",
@@ -279,7 +309,7 @@ jobs:
                   print(f"[ERROR] Shadowsocks 解析失败: {e}")
                   sys.exit(1)
 
-              print(f"[INFO] Shadowsocks -> {mask(address)}:{port}")
+              print(f"[INFO] Shadowsocks -> {mask(address)}:{mask_port(port)}")
 
               outbound = {
                   "protocol": "shadowsocks",
@@ -298,23 +328,17 @@ jobs:
           with open("xray_config.json", "w") as f:
               json.dump(config, f, indent=2)
 
-          print("[INFO] ✅ 代理配置已生成")
+          print("[INFO] ✅ Xray 代理配置已生成（所有协议均通过本地转发）")
           PYEOF
 
-          if [ -f "use_external_socks.txt" ]; then
-            EXTERNAL_SOCKS=$(cat use_external_socks.txt)
-            echo "PROXY_SERVER=$EXTERNAL_SOCKS" >> $GITHUB_ENV
-            echo "[INFO] ✅ 使用外部 SOCKS5 代理"
-            exit 0
-          fi
-
+          # 所有协议统一通过 Xray 本地转发
           ./xray/xray run -c xray_config.json > xray.log 2>&1 &
           sleep 5
 
-          echo "[INFO] 测试代理连接..."
+          echo "[INFO] 测试代理连通性..."
           for i in 1 2 3 4 5; do
             if curl -x socks5://127.0.0.1:1080 -s --max-time 15 https://api.ipify.org > /dev/null 2>&1; then
-              echo "[INFO] ✅ 代理连接成功"
+              echo "[INFO] ✅ 本地代理连接成功"
               echo "PROXY_SERVER=socks5://127.0.0.1:1080" >> $GITHUB_ENV
               exit 0
             fi
@@ -323,26 +347,41 @@ jobs:
           done
 
           echo "[ERROR] ❌ 代理连接失败"
-          cat xray.log
+          echo "[ERROR] 代理日志已保存为 artifact，请下载查看"
           exit 1
 
       - name: 恢复浏览器状态缓存
         id: cache-restore
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: browser_state
           key: hidencloud-state-${{ github.run_id }}
           restore-keys: |
             hidencloud-state-
 
-      - name: 清理 Chrome 锁文件
+      - name: 清理 Chrome 残留状态
         run: |
           PROFILE_DIR="browser_state/selenium_profile"
           if [ -d "$PROFILE_DIR" ]; then
-            echo "🧹 清理浏览器锁文件..."
+            echo "🧹 清理 Chrome 残留状态..."
+            # 锁文件（防止 Chrome 认为已有实例运行）
             find "$PROFILE_DIR" -name "SingletonLock" -delete 2>/dev/null || true
             find "$PROFILE_DIR" -name "SingletonSocket" -delete 2>/dev/null || true
             find "$PROFILE_DIR" -name "SingletonCookie" -delete 2>/dev/null || true
+            # 崩溃恢复标记（防止弹出"上次未正常关闭"并尝试恢复旧标签页）
+            rm -f "$PROFILE_DIR/Preferences.bak" 2>/dev/null || true
+            find "$PROFILE_DIR" -name "Session Storage" -type d -exec rm -rf {} + 2>/dev/null || true
+            find "$PROFILE_DIR" -name "sessionstore.js" -delete 2>/dev/null || true
+            find "$PROFILE_DIR" -name "Tabs" -delete 2>/dev/null || true
+            find "$PROFILE_DIR" -name "Current*" -path "*/Session*" -delete 2>/dev/null || true
+            # Web Data 锁
+            find "$PROFILE_DIR" -name "Web Data-journal" -delete 2>/dev/null || true
+            find "$PROFILE_DIR" -name "History-journal" -delete 2>/dev/null || true
+            find "$PROFILE_DIR" -name "Cookies-journal" -delete 2>/dev/null || true
+            find "$PROFILE_DIR" -name "Login Data-journal" -delete 2>/dev/null || true
+            # GPU/Shader 缓存（headless 不需要，且可能损坏）
+            find "$PROFILE_DIR" -name "GPUCache" -type d -exec rm -rf {} + 2>/dev/null || true
+            find "$PROFILE_DIR" -name "ShaderCache" -type d -exec rm -rf {} + 2>/dev/null || true
             echo "✅ 清理完成"
           else
             echo "📂 用户数据目录不存在，无需清理"
@@ -356,18 +395,25 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           PROXY_SERVER: ${{ env.PROXY_SERVER }}
         run: |
+          set -o pipefail
           python3 main.py 2>&1 | tee renew.log
 
-     # 如需上传日志截图，可取消注释以下步骤
-     # - name: 上传日志和截图
-     #   if: always()
-     #   uses: actions/upload-artifact@v4
-     #   with:
-     #     name: hidencloud-logs
-     #     path: |
-     #       screenshots/*.png
-     #       renew.log
-     #     retention-days: 3
+      - name: 上传日志和截图
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: hidencloud-logs-${{ github.run_id }}
+          path: |
+            ${{ github.workspace }}/screenshots/*.png
+            ${{ github.workspace }}/renew.log
+            ${{ github.workspace }}/xray.log
+          retention-days: 3
+          if-no-files-found: warn
+
+      - name: 清理敏感文件
+        if: always()
+        run: |
+          rm -f xray_config.json xray.log 2>/dev/null || true
 
       - name: 删除旧浏览器状态缓存
         if: always()
@@ -396,7 +442,7 @@ jobs:
 
       - name: 保存浏览器状态缓存
         if: success()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: browser_state
           key: hidencloud-state-${{ github.run_id }}
@@ -405,7 +451,11 @@ jobs:
         id: extract_due
         if: success()
         run: |
-          DUE_DATE=$(grep -oP '到期时间\(标准\): \K\d{4}-\d{2}-\d{2}' renew.log | tail -1 || echo "")
+          DUE_DATE=$(grep -oP '\[CRON_DUE\] \K\d{4}-\d{2}-\d{2}' renew.log | tail -1 || echo "")
+          if [ -z "$DUE_DATE" ]; then
+            # 兜底：尝试从旧格式中提取
+            DUE_DATE=$(grep -oP '到期时间\(标准\): \K\d{4}-\d{2}-\d{2}' renew.log | tail -1 || echo "")
+          fi
           if [ -z "$DUE_DATE" ]; then
             echo "skip_update=true" >> $GITHUB_OUTPUT
             echo "::warning::未能提取到期时间，跳过 Cron 更新"
@@ -464,7 +514,7 @@ jobs:
 
           echo "::notice::更新第 $LINE_NUM 行"
 
-          sed -i "${LINE_NUM}c\\    - cron: '$NEW_CRON'   # 自动更新下次运行时间" "$WORKFLOW_FILE"
+          sed -i "${LINE_NUM}c\    - cron: '$NEW_CRON' # 自动更新下次运行时间" "$WORKFLOW_FILE"
 
           if git diff --quiet "$WORKFLOW_FILE"; then
             echo "::notice::没有变化需要提交"
@@ -475,19 +525,22 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "$WORKFLOW_FILE"
           git commit -m "🔄 自动更新 HidenCloud 续期 Cron" \
-                     -m "下次运行: $NEXT_DATE UTC" \
-                     -m "Cron: $NEW_CRON" \
-                     -m "到期时间: $DUE_DATE"
+            -m "下次运行: $NEXT_DATE UTC" \
+            -m "Cron: $NEW_CRON" \
+            -m "到期时间: $DUE_DATE"
           git push
 
           echo "::notice::✅ Cron 更新成功"
 
       - name: 清理运行记录
         if: always()
-        uses: Mattraks/delete-workflow-runs@v2
-        with:
-          token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          delete_workflow_pattern: ${{ github.workflow }}
-          retain_days: 0
-          keep_minimum_runs: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "🗑️ 清理旧运行记录..."
+          gh run list --workflow="${{ github.workflow }}" --limit 100 --json databaseId \
+            --repo ${{ github.repository }} | jq -r '.[2:] | .[].databaseId' \
+            | while read -r RUN_ID; do
+              gh api -X DELETE "/repos/${{ github.repository }}/actions/runs/${RUN_ID}" 2>/dev/null || true
+            done
+          echo "✅ 旧运行记录已清理"
