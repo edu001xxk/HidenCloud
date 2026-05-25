@@ -208,7 +208,7 @@ def main():
             take_screenshot(driver, "03-credentials-filled")
 
             print("[INFO] ⏳ 等待 Turnstile 加载...")
-            time.sleep(5)
+            time.sleep(15)
 
             if driver.is_element_present(".cf-turnstile"):
                 print("[INFO] 🖱️ 尝试点击 Turnstile...")
@@ -218,7 +218,7 @@ def main():
                     driver.click(".cf-turnstile")
                 take_screenshot(driver, "04-turnstile-clicked")
 
-                if not wait_for_turnstile_token(driver, timeout=90):
+                if not wait_for_turnstile_token(driver, timeout=180):
                     take_screenshot(driver, "ERROR-turnstile-timeout")
                     raise Exception("Turnstile 验证超时")
                 take_screenshot(driver, "05-token-ready")
